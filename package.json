@@ -1,16 +1,21 @@
 {
-  "name": "eastchain-railway-hub",
+  "name": "east-railway-hub",
   "version": "1.0.0",
   "private": true,
-  "description": "Standalone WebSocket relay hub for the EASTCHAIN Light Node network",
-  "main": "server.js",
+  "description": "EAST Railway Hub — relay only, not part of consensus. Relays blocks from the L1 validator (Vercel) to connected Light Nodes, and forwards heartbeat/sync/ack/tx messages back.",
+  "main": "dist/server.js",
   "scripts": {
-    "start": "node server.js"
-  },
-  "engines": {
-    "node": ">=18"
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node src/server.ts"
   },
   "dependencies": {
     "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.5.0",
+    "ts-node": "^10.9.2"
   }
 }

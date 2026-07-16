@@ -1,54 +1,32 @@
-# EASTCHAIN Railway Hub
+# EAST Railway Hub
 
-Standalone relay server for the Light Node network. Plain Node.js, no
-Next.js, no Postgres — just an HTTP endpoint to receive new block headers
-and a WebSocket server to relay them to connected Light Nodes.
-
-## How it fits together
+Pure relay — **not** part of consensus. Sits between the L1 validator
+(EASTCHAIN on Vercel) and every connected Light Node.
 
 ```
-Vercel (mining-actions.ts)  --POST /publish-->  Railway Hub  --WS broadcast-->  Light Node (Mini App browser)
+Validator (Vercel, L1)
+   │  POST /internal/publish-block  (x-railway-secret header)
+   ▼
+Railway Hub  ───────────────►  broadcasts block:new to every Light Node (WS)
+   ▲
+   │  heartbeat / sync_request / ack / tx:submit  (WS, forwarded best-effort)
+Light Node (user's phone, browser WS client)
 ```
 
-## Deploy to Railway
+## Deploy on Railway
+1. Push this folder as its own repo (or a Railway service pointed at this subfolder).
+2. Railway auto-detects `package.json` → runs `npm run build` then `npm start`.
+3. Set environment variables in Railway:
+   - `RAILWAY_VALIDATOR_SECRET` — random long string. Must match the value
+     Vercel uses when it POSTs to `/internal/publish-block`.
+   - `PORT` — Railway sets this automatically, no need to set manually.
+4. Note the public URL Railway gives you (e.g. `https://east-hub-production.up.railway.app`).
+   - WS endpoint for Light Nodes: `wss://<that-domain>/`
+   - HTTP publish endpoint for Vercel: `https://<that-domain>/internal/publish-block`
+   - Debug status: `GET https://<that-domain>/status`
 
-**Option A — new repo (simplest):**
-1. Push this folder (`railway-hub/`) as its own GitHub repo.
-2. In Railway: New Project → Deploy from GitHub repo → pick it.
-3. Railway auto-detects Node.js and runs `npm install && npm start`.
-
-**Option B — subfolder of the existing `east-poc` repo:**
-1. Add this folder to your existing repo (e.g. at `railway-hub/`).
-2. In Railway: New Project → Deploy from GitHub repo → pick `east-poc`.
-3. In the new service's Settings → Source → **Root Directory**, set it to
-   `railway-hub`. Railway will only build/run from that subfolder.
-
-## Environment variables (set in Railway → Variables)
-
-| Key | Value |
-|---|---|
-| `RAILWAY_VALIDATOR_SECRET` | Same random secret you'll put in Vercel's `RAILWAY_VALIDATOR_SECRET` — must match exactly on both sides. |
-
-`PORT` is provided automatically by Railway — don't set it yourself.
-
-## After deploying
-
-1. Railway gives you a public domain, e.g. `eastchain-hub.up.railway.app`.
-   Go to Settings → Networking → make sure a public domain is generated.
-2. Set these in **Vercel** (Settings → Environment Variables), then redeploy:
-
-| Key | Value |
-|---|---|
-| `RAILWAY_PUBLISH_URL` | `https://eastchain-hub.up.railway.app/publish` |
-| `RAILWAY_VALIDATOR_SECRET` | the exact same secret you set on Railway |
-| `NEXT_PUBLIC_RAILWAY_WS_URL` | `wss://eastchain-hub.up.railway.app` (note `wss://`, not `https://`) |
-
-## Sanity checks
-
-- `curl https://<your-domain>/health` → should return
-  `{"status":"ok","connectedNodes":0,"latestHeight":-1,"historySize":0}`
-- After a real mining claim goes through on Vercel, `latestHeight` here
-  should bump up and `historySize` should grow.
-- Open the Mini App → Profile → Network Relay → tap Reconnect. Status
-  should flip to `CONNECTED`, and `connectedNodes` on `/health` should
-  go up by 1.
+## On the Vercel (Next.js) side
+Set these env vars:
+- `RAILWAY_PUBLISH_URL=https://<domain>/internal/publish-block`
+- `RAILWAY_VALIDATOR_SECRET=<same value as above>`
+- `NEXT_PUBLIC_RAILWAY_WS_URL=wss://<domain>/` (public — used by the browser Light Node client)
