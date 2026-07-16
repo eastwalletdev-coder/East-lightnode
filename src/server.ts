@@ -20,6 +20,39 @@ if (!VALIDATOR_SECRET) {
 const RELAY_ROSTER_SIZE = 5;
 const RELAY_RESCORE_INTERVAL_MS = 60_000;
 
+// ── Connection ceiling & per-IP rate limit ──────────────────────────
+// lightNodes was previously unbounded — fine at dozens of real users, a
+// real risk at thousands: one actor opening tens of thousands of bogus
+// connections can exhaust RAM/CPU that legitimate users need. Tune
+// MAX_LIGHT_NODES to whatever your current Railway plan can actually
+// hold — this is a safety ceiling, not a target to reach.
+const MAX_LIGHT_NODES = Number(process.env.MAX_LIGHT_NODES || 5000);
+// Max NEW connections a single IP may open within the window below.
+// Generous enough for someone with several tabs/devices on one NAT'd
+// network, tight enough to blunt a single-source connection flood.
+const IP_RATE_LIMIT_MAX = 10;
+const IP_RATE_LIMIT_WINDOW_MS = 60_000;
+const connectionAttemptsByIp = new Map<string, number[]>(); // ip -> timestamps within the window
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const recent = (connectionAttemptsByIp.get(ip) || []).filter((t) => now - t < IP_RATE_LIMIT_WINDOW_MS);
+  recent.push(now);
+  connectionAttemptsByIp.set(ip, recent);
+  return recent.length > IP_RATE_LIMIT_MAX;
+}
+
+// Prevents connectionAttemptsByIp from growing forever with one-off IPs —
+// without this it's the same unbounded-Map problem we're trying to fix.
+setInterval(() => {
+  const cutoff = Date.now() - IP_RATE_LIMIT_WINDOW_MS;
+  connectionAttemptsByIp.forEach((timestamps, ip) => {
+    const recent = timestamps.filter((t) => t > cutoff);
+    if (recent.length === 0) connectionAttemptsByIp.delete(ip);
+    else connectionAttemptsByIp.set(ip, recent);
+  });
+}, IP_RATE_LIMIT_WINDOW_MS);
+
 interface EastSocket extends WebSocket {
   isAlive?: boolean;
   role?: Role;
@@ -148,9 +181,32 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
 }
 
 const httpServer = createServer(handleHttp);
-const wss = new WebSocketServer({ server: httpServer });
+// perMessageDeflate OFF on purpose: compression gives a zlib buffer PER
+// CONNECTION (can be 100s of KB each), which adds up fast at 1GB RAM —
+// and our messages (headers, votes, signaling) are all a few hundred
+// bytes, so compression barely helps anyway. maxPayload caps a single
+// message at 64KB — generous for anything we actually send, but stops a
+// buggy/malicious client from forcing a huge buffer allocation.
+const wss = new WebSocketServer({ server: httpServer, perMessageDeflate: false, maxPayload: 64 * 1024 });
 
-wss.on("connection", (socket: EastSocket) => {
+wss.on("connection", (socket: EastSocket, req) => {
+  // req.socket.remoteAddress is Railway's edge IP unless x-forwarded-for is
+  // trusted — Railway's proxy does set this correctly for the real client IP.
+  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
+    || req.socket.remoteAddress || "unknown";
+
+  if (isRateLimited(ip)) {
+    send(socket, { type: "error", message: "RATE_LIMITED — too many connection attempts, try again shortly" });
+    socket.close();
+    return;
+  }
+  if (lightNodes.size >= MAX_LIGHT_NODES) {
+    send(socket, { type: "error", message: "HUB_AT_CAPACITY" });
+    socket.close();
+    console.log(`[RAILWAY] Rejected connection from ${ip} — at MAX_LIGHT_NODES (${MAX_LIGHT_NODES})`);
+    return;
+  }
+
   socket.isAlive = true;
 
   socket.on("pong", () => { socket.isAlive = true; });
@@ -254,8 +310,10 @@ wss.on("connection", (socket: EastSocket) => {
         if (socket.role !== "light-node") return;
         if (!validatorSocket) {
           send(socket, { type: "error", message: "VALIDATOR_OFFLINE" });
+          console.log(`[RAILWAY] tx:submit from ${socket.nodeId} dropped — validator offline`);
           return;
         }
+        console.log(`[RAILWAY] tx:submit relayed — from ${socket.nodeId}`);
         send(validatorSocket, msg);
         break;
       }
@@ -283,7 +341,16 @@ wss.on("connection", (socket: EastSocket) => {
         const target = lightNodes.get(msg.toNodeId);
         if (!target) {
           send(socket, { type: "error", message: `PEER_OFFLINE — ${msg.toNodeId}` });
+          console.log(`[RAILWAY] ${msg.type} from ${socket.nodeId} → ${msg.toNodeId} failed — peer offline`);
           return;
+        }
+        // Only log offer/answer, not every ICE candidate — a single WebRTC
+        // handshake can produce a dozen+ candidates and would flood this
+        // otherwise. Offer+answer alone is enough to see who's pairing up;
+        // whether the DataChannel actually opens afterward is invisible to
+        // Railway by design (see PeerMesh in webrtc-peer.ts client-side).
+        if (msg.type !== "ice_candidate") {
+          console.log(`[RAILWAY] ${msg.type} relayed: ${socket.nodeId} → ${msg.toNodeId}`);
         }
         send(target, { ...msg, fromNodeId: socket.nodeId });
         break;

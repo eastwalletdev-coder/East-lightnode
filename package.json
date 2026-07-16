@@ -2,11 +2,11 @@
   "name": "east-railway-hub",
   "version": "1.0.0",
   "private": true,
-  "description": "EAST Railway Hub — relay only, not part of consensus. Relays blocks from the L1 validator (Vercel) to connected Light Nodes, and forwards heartbeat/sync/ack/tx messages back.",
+  "description": "EAST Railway Hub - relay only, not part of consensus",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/server.js",
+    "start": "node --max-old-space-size=350 dist/server.js",
     "dev": "ts-node src/server.ts"
   },
   "dependencies": {
@@ -17,5 +17,8 @@
     "@types/ws": "^8.5.10",
     "typescript": "^5.5.0",
     "ts-node": "^10.9.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
