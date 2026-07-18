@@ -64,7 +64,7 @@ let validatorSocket: EastSocket | null = null;
 const lightNodes = new Map<string, EastSocket>();
 let latestHeader: BlockHeader | null = null;
 const recentHeaders: BlockHeader[] = []; // rolling buffer, newest last
-const BACKFILL_SIZE = 5;
+const BACKFILL_SIZE = 20;
 
 // Lightweight per-node telemetry for the /status endpoint (debug only —
 // this is NOT the source of truth for reward eligibility; that lives on
