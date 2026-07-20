@@ -92,39 +92,12 @@ export interface RelayStatsMessage {
   avgLatencyMs: number;
   participationSeconds: number;
   verifiedHeaderCount: number;
-  // A validator daemon that's caught its LOCAL ledger copy up to the
-  // network tip sets this so it can be offered to newly-joining
-  // validators as a full-sync source — reduces how often a brand new
-  // validator has to pull its entire history from Vercel directly.
-  // Purely self-reported like everything else in this message: Railway
-  // never trusts it for anything beyond "who to suggest as a source" —
-  // the requester still verifies every block it receives independently.
+  // Set by validator daemons (full-node-sync.js) once their LOCAL ledger has
+  // caught up to the network tip — never set by browser Light Nodes, which
+  // don't keep a full historical ledger and so can never serve one. Railway
+  // uses this purely to decide who to list in full_sync_providers below; it
+  // is NOT trusted for anything else (see the comment above this interface).
   hasFullLedger?: boolean;
-}
-
-// Broadcast periodically (piggybacks on the same rescore tick as
-// relay:roster) with which currently-connected nodes claim a full local
-// ledger copy. A new validator uses this to pick a peer instead of
-// defaulting straight to Vercel's /api/archive/blocks/[height].
-export interface FullSyncProvidersMessage { type: "full_sync_providers"; nodeIds: string[]; }
-
-// Blind relay, same pattern as webrtc_offer/webrtc_answer — Railway
-// forwards by toNodeId without reading the payload. blocks[] shape must
-// match whatever /api/archive/blocks/[height] returns (header + txs) so a
-// receiving daemon can verify each one exactly the same way regardless of
-// whether it came from a peer or from Vercel directly.
-export interface FullSyncRequestMessage {
-  type: "full_sync_request";
-  fromNodeId?: string;
-  toNodeId: string;
-  fromHeight: number;
-  toHeight: number;
-}
-export interface FullSyncResponseMessage {
-  type: "full_sync_response";
-  fromNodeId?: string;
-  toNodeId: string;
-  blocks: unknown[]; // opaque to Railway — see BlockWithTxs in the Next.js app / daemon for the real shape
 }
 
 // Broadcast periodically to ALL light nodes with the current top-N relay
@@ -137,6 +110,37 @@ export interface RelayRosterMessage {
 // Sent 1:1 to a node when it enters/leaves the top-N this round.
 export interface RelayPromotedMessage { type: "relay:promoted"; }
 export interface RelayDemotedMessage { type: "relay:demoted"; }
+
+// ── Peer-to-peer full sync (catch-up) ───────────────────────────────
+// Lets a node with a gap ask a PEER for the missing block range before
+// ever hitting Vercel's archive API — spreads catch-up load across
+// validators/light nodes instead of funneling every gap through
+// serverless invocations. Only nodes that reported hasFullLedger:true
+// (see RelayStatsMessage) are ever listed here — browser Light Nodes
+// never qualify, since they don't retain full history to serve.
+//
+// Railway's role is strictly a blind relay for the request/response pair
+// (same pattern as webrtc_offer/answer below) — it never inspects or
+// verifies the block contents. The requester independently verifies every
+// block it receives (same verifyHeader()/verifyBlock() check used for
+// Railway- and archive-sourced blocks) before trusting any of it.
+export interface FullSyncProvidersMessage {
+  type: "full_sync_providers";
+  nodeIds: string[];
+}
+export interface FullSyncRequestMessage {
+  type: "full_sync_request";
+  fromNodeId: string; // set by Railway on relay, ignored if sent by client
+  toNodeId: string;
+  fromHeight: number;
+  toHeight: number;
+}
+export interface FullSyncResponseMessage {
+  type: "full_sync_response";
+  fromNodeId: string; // set by Railway on relay, ignored if sent by client
+  toNodeId: string;
+  blocks: BlockHeader[];
+}
 
 // ── WebRTC signaling passthrough ────────────────────────────────────
 // Railway just forwards these by toNodeId → socket lookup, unmodified,
@@ -172,10 +176,10 @@ export type InboundMessage =
   | AckMessage
   | TxSubmitMessage
   | RelayStatsMessage
+  | FullSyncRequestMessage
+  | FullSyncResponseMessage
   | WebrtcOfferMessage
   | WebrtcAnswerMessage
   | IceCandidateMessage
-  | FullSyncRequestMessage
-  | FullSyncResponseMessage
   | PingMessage;
 

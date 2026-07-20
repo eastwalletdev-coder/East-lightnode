@@ -83,6 +83,20 @@ const telemetry = new Map<string, NodeTelemetry>();
 let currentRelayRoster: string[] = [];
 let currentFullSyncProviders: string[] = [];
 
+function recomputeFullSyncProviders() {
+  const providers = [...telemetry.entries()]
+    .filter(([, t]) => t.hasFullLedger)
+    .map(([nodeId]) => nodeId);
+  const changed =
+    providers.length !== currentFullSyncProviders.length ||
+    providers.some((id) => !currentFullSyncProviders.includes(id));
+  currentFullSyncProviders = providers;
+  if (changed) {
+    broadcastToLightNodes({ type: "full_sync_providers", nodeIds: currentFullSyncProviders });
+    console.log(`[RAILWAY] Full-sync providers updated: [${currentFullSyncProviders.join(", ")}]`);
+  }
+}
+
 function score(t: NodeTelemetry): number {
   // Higher is better. Latency dominates inversely (a laggy node makes a bad
   // relay regardless of how long it's been up); uptime and verified-header
@@ -112,17 +126,6 @@ function recomputeRelayRoster() {
   if (newlyPromoted.length || newlyDemoted.length) {
     console.log(`[RAILWAY] Relay roster updated: [${currentRelayRoster.join(", ")}]`);
   }
-}
-
-// Unlike the relay roster (capped top-N by latency), every node that
-// claims a full ledger copy gets listed — a new validator wants as many
-// options as possible to pick a peer from, not just the "fastest" few.
-function recomputeFullSyncProviders() {
-  currentFullSyncProviders = [...telemetry.entries()]
-    .filter(([, t]) => t.hasFullLedger)
-    .map(([nodeId]) => nodeId);
-  broadcastToLightNodes({ type: "full_sync_providers", nodeIds: currentFullSyncProviders });
-  console.log(`[RAILWAY] Full-sync providers updated: [${currentFullSyncProviders.join(", ")}]`);
 }
 
 function send(socket: EastSocket, msg: unknown) {
@@ -156,6 +159,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
       lightNodesConnected: lightNodes.size,
       latestHeight: latestHeader?.height ?? -1,
       relayRoster: currentRelayRoster,
+      fullSyncProviders: currentFullSyncProviders,
       nodes: [...telemetry.entries()].map(([nodeId, t]) => ({ nodeId, ...t })),
     }));
     return;
@@ -263,8 +267,8 @@ wss.on("connection", (socket: EastSocket, req) => {
             avgLatencyMs: 0, participationSeconds: 0, verifiedHeaderCount: 0, isRelay: false, hasFullLedger: false,
           });
           console.log(`[RAILWAY] Light node connected: ${msg.nodeId} (${lightNodes.size} total)`);
-          // Let the new node know who's currently relay-eligible right away,
-          // instead of waiting up to RELAY_RESCORE_INTERVAL_MS for the next tick.
+          // Let the new node know who's currently relay-eligible / a full-sync
+          // provider right away, instead of waiting for the next scheduled tick.
           send(socket, { type: "relay:roster", relayNodeIds: currentRelayRoster });
           send(socket, { type: "full_sync_providers", nodeIds: currentFullSyncProviders });
         }
@@ -342,26 +346,32 @@ wss.on("connection", (socket: EastSocket, req) => {
           t.avgLatencyMs = msg.avgLatencyMs;
           t.participationSeconds = msg.participationSeconds;
           t.verifiedHeaderCount = msg.verifiedHeaderCount;
-          const wasFullLedger = t.hasFullLedger;
-          t.hasFullLedger = !!msg.hasFullLedger;
-          if (wasFullLedger !== t.hasFullLedger) recomputeFullSyncProviders();
+          const hadFullLedger = t.hasFullLedger;
+          t.hasFullLedger = msg.hasFullLedger ?? false;
+          if (t.hasFullLedger !== hadFullLedger) recomputeFullSyncProviders();
         }
         break;
       }
 
-      // ── Full-ledger sync — blind passthrough by nodeId, same trust
-      // model as WebRTC signaling: Railway never reads block contents,
-      // and whatever arrives still gets independently verified by the
-      // receiving daemon exactly like a Vercel-sourced block would. ───
-      case "full_sync_request":
-      case "full_sync_response": {
+      // ── Peer-to-peer full sync — blind passthrough by nodeId, same
+      // pattern as webrtc_offer/answer below. Railway never reads the
+      // block contents; the requester verifies everything independently. ──
+      case "full_sync_request": {
         if (socket.role !== "light-node" || !socket.nodeId) return;
         const target = lightNodes.get(msg.toNodeId);
         if (!target) {
           send(socket, { type: "error", message: `PEER_OFFLINE — ${msg.toNodeId}` });
           return;
         }
-        console.log(`[RAILWAY] ${msg.type} relayed: ${socket.nodeId} → ${msg.toNodeId}`);
+        console.log(`[RAILWAY] full_sync_request relayed: ${socket.nodeId} → ${msg.toNodeId} (#${msg.fromHeight}–#${msg.toHeight})`);
+        send(target, { ...msg, fromNodeId: socket.nodeId });
+        break;
+      }
+
+      case "full_sync_response": {
+        if (socket.role !== "light-node" || !socket.nodeId) return;
+        const target = lightNodes.get(msg.toNodeId);
+        if (!target) return; // requester disconnected mid-transfer — drop silently
         send(target, { ...msg, fromNodeId: socket.nodeId });
         break;
       }
@@ -410,8 +420,7 @@ wss.on("connection", (socket: EastSocket, req) => {
         broadcastToLightNodes({ type: "relay:roster", relayNodeIds: currentRelayRoster });
       }
       if (currentFullSyncProviders.includes(socket.nodeId)) {
-        currentFullSyncProviders = currentFullSyncProviders.filter((id) => id !== socket.nodeId);
-        broadcastToLightNodes({ type: "full_sync_providers", nodeIds: currentFullSyncProviders });
+        recomputeFullSyncProviders();
       }
     }
   });
@@ -430,6 +439,7 @@ setInterval(() => {
 // Rescore + re-promote relay candidates periodically. Runs independently of
 // any block activity — a quiet chain shouldn't mean a stale relay roster.
 setInterval(recomputeRelayRoster, RELAY_RESCORE_INTERVAL_MS);
+setInterval(recomputeFullSyncProviders, RELAY_RESCORE_INTERVAL_MS);
 
 httpServer.listen(PORT, () => {
   console.log(`[RAILWAY] EAST Hub listening on :${PORT} (WS + HTTP)`);
