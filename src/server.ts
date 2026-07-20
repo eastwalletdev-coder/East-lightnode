@@ -64,7 +64,7 @@ let validatorSocket: EastSocket | null = null;
 const lightNodes = new Map<string, EastSocket>();
 let latestHeader: BlockHeader | null = null;
 const recentHeaders: BlockHeader[] = []; // rolling buffer, newest last
-const BACKFILL_SIZE = 20;
+const BACKFILL_SIZE = 5;
 
 // Lightweight per-node telemetry for the /status endpoint (debug only —
 // this is NOT the source of truth for reward eligibility; that lives on
@@ -77,9 +77,11 @@ interface NodeTelemetry {
   participationSeconds: number;
   verifiedHeaderCount: number;
   isRelay: boolean;
+  hasFullLedger: boolean;
 }
 const telemetry = new Map<string, NodeTelemetry>();
 let currentRelayRoster: string[] = [];
+let currentFullSyncProviders: string[] = [];
 
 function score(t: NodeTelemetry): number {
   // Higher is better. Latency dominates inversely (a laggy node makes a bad
@@ -110,6 +112,17 @@ function recomputeRelayRoster() {
   if (newlyPromoted.length || newlyDemoted.length) {
     console.log(`[RAILWAY] Relay roster updated: [${currentRelayRoster.join(", ")}]`);
   }
+}
+
+// Unlike the relay roster (capped top-N by latency), every node that
+// claims a full ledger copy gets listed — a new validator wants as many
+// options as possible to pick a peer from, not just the "fastest" few.
+function recomputeFullSyncProviders() {
+  currentFullSyncProviders = [...telemetry.entries()]
+    .filter(([, t]) => t.hasFullLedger)
+    .map(([nodeId]) => nodeId);
+  broadcastToLightNodes({ type: "full_sync_providers", nodeIds: currentFullSyncProviders });
+  console.log(`[RAILWAY] Full-sync providers updated: [${currentFullSyncProviders.join(", ")}]`);
 }
 
 function send(socket: EastSocket, msg: unknown) {
@@ -247,12 +260,13 @@ wss.on("connection", (socket: EastSocket, req) => {
           lightNodes.set(msg.nodeId, socket);
           telemetry.set(msg.nodeId, {
             lastHeartbeat: Date.now(), lastAckHeight: -1, connectedAt: Date.now(),
-            avgLatencyMs: 0, participationSeconds: 0, verifiedHeaderCount: 0, isRelay: false,
+            avgLatencyMs: 0, participationSeconds: 0, verifiedHeaderCount: 0, isRelay: false, hasFullLedger: false,
           });
           console.log(`[RAILWAY] Light node connected: ${msg.nodeId} (${lightNodes.size} total)`);
           // Let the new node know who's currently relay-eligible right away,
           // instead of waiting up to RELAY_RESCORE_INTERVAL_MS for the next tick.
           send(socket, { type: "relay:roster", relayNodeIds: currentRelayRoster });
+          send(socket, { type: "full_sync_providers", nodeIds: currentFullSyncProviders });
         }
         send(socket, {
           type: "welcome", network: "EAST", chainId: EAST_CHAIN_ID, version: "1.1",
@@ -328,7 +342,27 @@ wss.on("connection", (socket: EastSocket, req) => {
           t.avgLatencyMs = msg.avgLatencyMs;
           t.participationSeconds = msg.participationSeconds;
           t.verifiedHeaderCount = msg.verifiedHeaderCount;
+          const wasFullLedger = t.hasFullLedger;
+          t.hasFullLedger = !!msg.hasFullLedger;
+          if (wasFullLedger !== t.hasFullLedger) recomputeFullSyncProviders();
         }
+        break;
+      }
+
+      // ── Full-ledger sync — blind passthrough by nodeId, same trust
+      // model as WebRTC signaling: Railway never reads block contents,
+      // and whatever arrives still gets independently verified by the
+      // receiving daemon exactly like a Vercel-sourced block would. ───
+      case "full_sync_request":
+      case "full_sync_response": {
+        if (socket.role !== "light-node" || !socket.nodeId) return;
+        const target = lightNodes.get(msg.toNodeId);
+        if (!target) {
+          send(socket, { type: "error", message: `PEER_OFFLINE — ${msg.toNodeId}` });
+          return;
+        }
+        console.log(`[RAILWAY] ${msg.type} relayed: ${socket.nodeId} → ${msg.toNodeId}`);
+        send(target, { ...msg, fromNodeId: socket.nodeId });
         break;
       }
 
@@ -374,6 +408,10 @@ wss.on("connection", (socket: EastSocket, req) => {
       if (currentRelayRoster.includes(socket.nodeId)) {
         currentRelayRoster = currentRelayRoster.filter((id) => id !== socket.nodeId);
         broadcastToLightNodes({ type: "relay:roster", relayNodeIds: currentRelayRoster });
+      }
+      if (currentFullSyncProviders.includes(socket.nodeId)) {
+        currentFullSyncProviders = currentFullSyncProviders.filter((id) => id !== socket.nodeId);
+        broadcastToLightNodes({ type: "full_sync_providers", nodeIds: currentFullSyncProviders });
       }
     }
   });

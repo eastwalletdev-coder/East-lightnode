@@ -92,6 +92,39 @@ export interface RelayStatsMessage {
   avgLatencyMs: number;
   participationSeconds: number;
   verifiedHeaderCount: number;
+  // A validator daemon that's caught its LOCAL ledger copy up to the
+  // network tip sets this so it can be offered to newly-joining
+  // validators as a full-sync source — reduces how often a brand new
+  // validator has to pull its entire history from Vercel directly.
+  // Purely self-reported like everything else in this message: Railway
+  // never trusts it for anything beyond "who to suggest as a source" —
+  // the requester still verifies every block it receives independently.
+  hasFullLedger?: boolean;
+}
+
+// Broadcast periodically (piggybacks on the same rescore tick as
+// relay:roster) with which currently-connected nodes claim a full local
+// ledger copy. A new validator uses this to pick a peer instead of
+// defaulting straight to Vercel's /api/archive/blocks/[height].
+export interface FullSyncProvidersMessage { type: "full_sync_providers"; nodeIds: string[]; }
+
+// Blind relay, same pattern as webrtc_offer/webrtc_answer — Railway
+// forwards by toNodeId without reading the payload. blocks[] shape must
+// match whatever /api/archive/blocks/[height] returns (header + txs) so a
+// receiving daemon can verify each one exactly the same way regardless of
+// whether it came from a peer or from Vercel directly.
+export interface FullSyncRequestMessage {
+  type: "full_sync_request";
+  fromNodeId?: string;
+  toNodeId: string;
+  fromHeight: number;
+  toHeight: number;
+}
+export interface FullSyncResponseMessage {
+  type: "full_sync_response";
+  fromNodeId?: string;
+  toNodeId: string;
+  blocks: unknown[]; // opaque to Railway — see BlockWithTxs in the Next.js app / daemon for the real shape
 }
 
 // Broadcast periodically to ALL light nodes with the current top-N relay
@@ -142,5 +175,7 @@ export type InboundMessage =
   | WebrtcOfferMessage
   | WebrtcAnswerMessage
   | IceCandidateMessage
+  | FullSyncRequestMessage
+  | FullSyncResponseMessage
   | PingMessage;
 
