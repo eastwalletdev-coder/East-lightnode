@@ -249,6 +249,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
   const timestamp = new Date().toISOString();
 
   if (req.method === "GET" && req.url === "/status") {
+    const latestBlockHash = latestHeader?.hash ? latestHeader.hash.substring(0, 16) + "..." : "none";
     const status = {
       ok: true,
       timestamp,
@@ -256,7 +257,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
       lightNodesConnected: lightNodes.size,
       maxLightNodes: MAX_LIGHT_NODES,
       latestHeight: latestHeader?.height ?? -1,
-      latestBlockHash: latestHeader?.hash?.substring(0, 16) + "..." ?? "none",
+      latestBlockHash,
       relayRoster: currentRelayRoster,
       relayRosterSize: currentRelayRoster.length,
       fullSyncProviders: currentFullSyncProviders,
@@ -451,8 +452,9 @@ wss.on("connection", (socket: EastSocket, req) => {
           send(socket, { type: "relay:roster", relayNodeIds: currentRelayRoster });
           send(socket, { type: "full_sync_providers", nodeIds: currentFullSyncProviders });
 
-          if (t = telemetry.get(msg.nodeId)) {
-            t.messagesSent += 2;
+          const nodeTelemetry = telemetry.get(msg.nodeId);
+          if (nodeTelemetry) {
+            nodeTelemetry.messagesSent += 2;
           }
         }
 
@@ -465,8 +467,11 @@ wss.on("connection", (socket: EastSocket, req) => {
           latestHeight: latestHeader?.height ?? -1,
         });
 
-        if (socket.role === "light-node" && (t = telemetry.get(socket.nodeId!))) {
-          t.messagesSent++;
+        if (socket.role === "light-node" && socket.nodeId) {
+          const nodeTelemetry = telemetry.get(socket.nodeId);
+          if (nodeTelemetry) {
+            nodeTelemetry.messagesSent++;
+          }
         }
 
         break;
@@ -496,10 +501,10 @@ wss.on("connection", (socket: EastSocket, req) => {
           logDebug("HEARTBEAT", `⚠️  Heartbeat from non-light-node`, { role: socket.role, nodeId: socket.nodeId });
           return;
         }
-        const t = telemetry.get(socket.nodeId);
-        if (t) {
-          t.lastHeartbeat = Date.now();
-          t.messagesSent++;
+        const nodeTelemetry = telemetry.get(socket.nodeId);
+        if (nodeTelemetry) {
+          nodeTelemetry.lastHeartbeat = Date.now();
+          nodeTelemetry.messagesSent++;
         }
         if (validatorSocket) {
           send(validatorSocket, msg);
@@ -534,8 +539,8 @@ wss.on("connection", (socket: EastSocket, req) => {
 
         if (backfill.length > 0) {
           send(socket, { type: "block:backfill", headers: backfill });
-          const t = telemetry.get(socket.nodeId);
-          if (t) t.messagesSent++;
+          const nodeTelemetry = telemetry.get(socket.nodeId);
+          if (nodeTelemetry) nodeTelemetry.messagesSent++;
           log("SYNC", `📦 Backfill sent`, {
             nodeId: socket.nodeId,
             blocksCount: backfill.length,
@@ -556,10 +561,10 @@ wss.on("connection", (socket: EastSocket, req) => {
 
       case "ack": {
         if (socket.role !== "light-node" || !socket.nodeId) return;
-        const t = telemetry.get(socket.nodeId);
-        if (t) {
-          t.lastAckHeight = msg.height;
-          t.messagesSent++;
+        const nodeTelemetry = telemetry.get(socket.nodeId);
+        if (nodeTelemetry) {
+          nodeTelemetry.lastAckHeight = msg.height;
+          nodeTelemetry.messagesSent++;
         }
 
         log("ACK", `✅ ACK received and relayed`, {
@@ -586,21 +591,21 @@ wss.on("connection", (socket: EastSocket, req) => {
           hasPayload: !!msg.payload,
         });
         send(validatorSocket, msg);
-        const t = telemetry.get(socket.nodeId);
-        if (t) t.messagesSent++;
+        const nodeTelemetry = telemetry.get(socket.nodeId);
+        if (nodeTelemetry) nodeTelemetry.messagesSent++;
         break;
       }
 
       // ── Relay scoring: node self-reports, Railway just stores it ────
       case "relay_stats": {
         if (socket.role !== "light-node" || !socket.nodeId) return;
-        const t = telemetry.get(socket.nodeId);
-        if (t) {
-          t.avgLatencyMs = msg.avgLatencyMs;
-          t.participationSeconds = msg.participationSeconds;
-          t.verifiedHeaderCount = msg.verifiedHeaderCount;
-          const hadFullLedger = t.hasFullLedger;
-          t.hasFullLedger = msg.hasFullLedger ?? false;
+        const nodeTelemetry = telemetry.get(socket.nodeId);
+        if (nodeTelemetry) {
+          nodeTelemetry.avgLatencyMs = msg.avgLatencyMs;
+          nodeTelemetry.participationSeconds = msg.participationSeconds;
+          nodeTelemetry.verifiedHeaderCount = msg.verifiedHeaderCount;
+          const hadFullLedger = nodeTelemetry.hasFullLedger;
+          nodeTelemetry.hasFullLedger = msg.hasFullLedger ?? false;
 
           log("RELAY_STATS", `📊 Relay stats updated`, {
             nodeId: socket.nodeId,
@@ -611,7 +616,7 @@ wss.on("connection", (socket: EastSocket, req) => {
             fullLedgerChanged: hadFullLedger !== (msg.hasFullLedger ?? false),
           });
 
-          if (t.hasFullLedger !== hadFullLedger) {
+          if (nodeTelemetry.hasFullLedger !== hadFullLedger) {
             recomputeFullSyncProviders();
           }
         }
@@ -638,8 +643,8 @@ wss.on("connection", (socket: EastSocket, req) => {
           blockCount: msg.toHeight - msg.fromHeight + 1,
         });
         send(target, { ...msg, fromNodeId: socket.nodeId });
-        const t2 = telemetry.get(msg.toNodeId);
-        if (t2) t2.messagesSent++;
+        const targetTelemetry = telemetry.get(msg.toNodeId);
+        if (targetTelemetry) targetTelemetry.messagesSent++;
         break;
       }
 
@@ -656,8 +661,8 @@ wss.on("connection", (socket: EastSocket, req) => {
           blocksCount: msg.blocks?.length ?? 0,
         });
         send(target, { ...msg, fromNodeId: socket.nodeId });
-        const t2 = telemetry.get(msg.toNodeId);
-        if (t2) t2.messagesSent++;
+        const targetTelemetry = telemetry.get(msg.toNodeId);
+        if (targetTelemetry) targetTelemetry.messagesSent++;
         break;
       }
 
@@ -685,8 +690,8 @@ wss.on("connection", (socket: EastSocket, req) => {
           });
         }
         send(target, { ...msg, fromNodeId: socket.nodeId });
-        const t2 = telemetry.get(msg.toNodeId);
-        if (t2) t2.messagesSent++;
+        const targetTelemetry = telemetry.get(msg.toNodeId);
+        if (targetTelemetry) targetTelemetry.messagesSent++;
         break;
       }
 
