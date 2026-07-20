@@ -6,7 +6,7 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
-    "start": "npm run build && node --max-old-space-size=350 dist/server.js",
+    "start": "node dist/server.js",
     "dev": "ts-node src/server.ts"
   },
   "dependencies": {
