@@ -87,7 +87,7 @@ let validatorSocket: EastSocket | null = null;
 const lightNodes = new Map<string, EastSocket>();
 let latestHeader: BlockHeader | null = null;
 const recentHeaders: BlockHeader[] = []; // rolling buffer, newest last
-const BACKFILL_SIZE = 50; // Increased from 5 to 50 for better sync
+const BACKFILL_SIZE = 1000; // How many recent headers sync_request can serve — kept in sync with the ring buffer trim below and with client.ts's RAILWAY_BACKFILL_LIMIT
 
 // Node telemetry for /status endpoint
 interface NodeTelemetry {
@@ -223,7 +223,7 @@ function publishBlock(header: BlockHeader) {
   const oldHeight = latestHeader?.height ?? -1;
   latestHeader = header;
   recentHeaders.push(header);
-  if (recentHeaders.length > 20) recentHeaders.shift();
+  if (recentHeaders.length > BACKFILL_SIZE) recentHeaders.shift();
 
   log("BLOCK", `📦 Publishing block`, {
     height: header.height,
