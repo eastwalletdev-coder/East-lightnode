@@ -79,6 +79,37 @@ export interface TxSubmitMessage {
   payload: unknown;
 }
 
+// ── Tiered gossip hierarchy ────────────────────────────────────────────
+// Replaces the old flat top-5 "everyone dials the same relays" roster,
+// which doesn't scale (RELAY_ROSTER_SIZE=5 × MAX_MESH_PEERS on the client
+// meant only ~100 total lightnodes could ever hold a P2P slot — everyone
+// past that fell back to hitting Vercel/the validator/the archive
+// directly, defeating the point). Instead, ALL scored nodes are ranked by
+// the same score() function and sliced into 4 tiers, each node getting
+// exactly ONE parent to dial (not a menu of candidates):
+//   Leader (rank 0, 1 node)       — parent: null, talks to Railway directly
+//   Guardian (rank 1-20, 20)      — parent: the Leader
+//   Broadcaster (rank 21-420, 400)— parent: one of the 20 Guardians
+//   Vision (rank 421-8420, 8000)  — parent: one of the 400 Broadcasters
+//   none (rank 8421+, or not yet scored) — parent: null, falls back to
+//     Railway/archive/validator directly same as today, until scored in
+//     on a future rescore
+// A new block flows Leader → its 20 Guardians → their 400 Broadcasters →
+// their 8000 Visions, 3 WebRTC hops covering up to ~8421 nodes instead of
+// however many thousand all hitting Railway/Vercel independently. Railway
+// holds the whole tree structure in memory (see telemetry map) since it
+// computed it — nodes don't need to track their own subtree.
+export type NodeTier = "leader" | "guardian" | "broadcaster" | "vision" | "none";
+
+// Sent 1:1 whenever a node's tier or parent changes (including on first
+// assignment). parentNodeId is null only for "leader" and "none" — both
+// of those talk to Railway/Vercel directly instead of a WebRTC parent.
+export interface TierAssignMessage {
+  type: "tier:assign";
+  tier: NodeTier;
+  parentNodeId: string | null;
+}
+
 // ── Relay scoring & promotion ─────────────────────────────────────────
 // A light node self-reports its own measured connection quality; Railway
 // never trusts this alone for anything security-relevant (a lying node can
@@ -99,17 +130,6 @@ export interface RelayStatsMessage {
   // is NOT trusted for anything else (see the comment above this interface).
   hasFullLedger?: boolean;
 }
-
-// Broadcast periodically to ALL light nodes with the current top-N relay
-// roster, so any node can decide who to attempt a WebRTC connection to.
-export interface RelayRosterMessage {
-  type: "relay:roster";
-  relayNodeIds: string[];
-}
-
-// Sent 1:1 to a node when it enters/leaves the top-N this round.
-export interface RelayPromotedMessage { type: "relay:promoted"; }
-export interface RelayDemotedMessage { type: "relay:demoted"; }
 
 // ── Peer-to-peer full sync (catch-up) ───────────────────────────────
 // Lets a node with a gap ask a PEER for the missing block range before

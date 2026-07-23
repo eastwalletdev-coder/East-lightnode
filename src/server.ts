@@ -1,7 +1,7 @@
 import { createServer, IncomingMessage, ServerResponse } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import {
-  InboundMessage, BlockHeader, Role, EAST_CHAIN_ID,
+  InboundMessage, BlockHeader, Role, EAST_CHAIN_ID, NodeTier,
 } from "./types";
 
 const PORT = Number(process.env.PORT || process.env.WS_PORT || 8081);
@@ -36,7 +36,9 @@ if (!VALIDATOR_SECRET) {
 log("RAILWAY", `🚀 Starting Railway Hub on port ${PORT}`, { DEBUG_MODE });
 
 // Top-N light nodes by score get promoted to "relay"
-const RELAY_ROSTER_SIZE = 5;
+const GUARDIAN_COUNT = 20;
+const BROADCASTER_COUNT = 400; // 20 per guardian
+const VISION_COUNT = 8000; // 20 per broadcaster
 const RELAY_RESCORE_INTERVAL_MS = 60_000;
 
 // Connection ceiling & per-IP rate limit
@@ -97,7 +99,8 @@ interface NodeTelemetry {
   avgLatencyMs: number;
   participationSeconds: number;
   verifiedHeaderCount: number;
-  isRelay: boolean;
+  tier: NodeTier;
+  parentNodeId: string | null;
   hasFullLedger: boolean;
   messagesReceived: number;
   messagesSent: number;
@@ -105,7 +108,6 @@ interface NodeTelemetry {
   lastMessageTime?: number;
 }
 const telemetry = new Map<string, NodeTelemetry>();
-let currentRelayRoster: string[] = [];
 let currentFullSyncProviders: string[] = [];
 
 // ─── Message counters for statistics ─────────────────────────────
@@ -139,52 +141,67 @@ function score(t: NodeTelemetry): number {
   return latencyScore * Math.log1p(t.participationSeconds) * Math.log1p(t.verifiedHeaderCount);
 }
 
-function recomputeRelayRoster() {
+function recomputeTiers() {
   const validNodes = [...telemetry.entries()].filter(([, t]) => t.avgLatencyMs > 0);
-  logDebug("RELAY", `Computing roster from ${validNodes.length} valid nodes`, { totalNodes: telemetry.size });
+  logDebug("TIERS", `Computing tiers from ${validNodes.length} valid nodes`, { totalNodes: telemetry.size });
 
   const ranked = validNodes
     .sort(([, a], [, b]) => score(b) - score(a))
-    .slice(0, RELAY_ROSTER_SIZE)
     .map(([nodeId]) => nodeId);
 
-  const newlyPromoted = ranked.filter((id) => !currentRelayRoster.includes(id));
-  const newlyDemoted = currentRelayRoster.filter((id) => !ranked.includes(id));
+  const leaderId: string | null = ranked[0] ?? null;
+  const guardianIds = ranked.slice(1, 1 + GUARDIAN_COUNT);
+  const broadcasterIds = ranked.slice(1 + GUARDIAN_COUNT, 1 + GUARDIAN_COUNT + BROADCASTER_COUNT);
+  const visionIds = ranked.slice(
+    1 + GUARDIAN_COUNT + BROADCASTER_COUNT,
+    1 + GUARDIAN_COUNT + BROADCASTER_COUNT + VISION_COUNT
+  );
 
-  for (const [nodeId, t] of telemetry.entries()) {
-    t.isRelay = ranked.includes(nodeId);
-  }
+  // Build the new (tier, parent) for every node currently known, whether
+  // ranked into a tier or not (unranked nodes explicitly get tier:"none",
+  // parent:null — same as an unscored brand-new node, falls back to
+  // Railway/archive/validator directly per client.ts's own bootstrap path).
+  const assignments = new Map<string, { tier: NodeTier; parentNodeId: string | null }>();
+  for (const nodeId of telemetry.keys()) assignments.set(nodeId, { tier: "none", parentNodeId: null });
 
-  newlyPromoted.forEach((id) => {
-    const s = lightNodes.get(id);
-    if (s) {
-      send(s, { type: "relay:promoted" });
-      log("RELAY", `🎯 Node promoted to relay`, { nodeId: id });
-    }
+  if (leaderId) assignments.set(leaderId, { tier: "leader", parentNodeId: null });
+  guardianIds.forEach((id) => assignments.set(id, { tier: "guardian", parentNodeId: leaderId }));
+  broadcasterIds.forEach((id, i) => {
+    const parent = guardianIds.length > 0 ? guardianIds[i % guardianIds.length] : leaderId;
+    assignments.set(id, { tier: "broadcaster", parentNodeId: parent });
+  });
+  visionIds.forEach((id, i) => {
+    const parent = broadcasterIds.length > 0 ? broadcasterIds[i % broadcasterIds.length]
+      : (guardianIds.length > 0 ? guardianIds[i % guardianIds.length] : leaderId);
+    assignments.set(id, { tier: "vision", parentNodeId: parent });
   });
 
-  newlyDemoted.forEach((id) => {
-    const s = lightNodes.get(id);
-    if (s) {
-      send(s, { type: "relay:demoted" });
-      log("RELAY", `📉 Node demoted from relay`, { nodeId: id });
+  let changedCount = 0;
+  for (const [nodeId, next] of assignments) {
+    const t = telemetry.get(nodeId);
+    if (!t) continue;
+    const changed = t.tier !== next.tier || t.parentNodeId !== next.parentNodeId;
+    t.tier = next.tier;
+    t.parentNodeId = next.parentNodeId;
+    if (changed) {
+      changedCount++;
+      const s = lightNodes.get(nodeId);
+      if (s) {
+        send(s, { type: "tier:assign", tier: next.tier, parentNodeId: next.parentNodeId });
+      }
     }
-  });
-
-  currentRelayRoster = ranked;
-  broadcastToLightNodes({ type: "relay:roster", relayNodeIds: currentRelayRoster });
-
-  if (newlyPromoted.length || newlyDemoted.length) {
-    log("RELAY", `🔄 Relay roster updated`, {
-      roster: currentRelayRoster,
-      promoted: newlyPromoted,
-      demoted: newlyDemoted,
-      total: currentRelayRoster.length,
-    });
-  } else {
-    logDebug("RELAY", "Relay roster unchanged", { roster: currentRelayRoster });
   }
+
+  log("TIERS", `🌳 Tier hierarchy recomputed`, {
+    leader: leaderId,
+    guardians: guardianIds.length,
+    broadcasters: broadcasterIds.length,
+    visions: visionIds.length,
+    unranked: telemetry.size - (leaderId ? 1 : 0) - guardianIds.length - broadcasterIds.length - visionIds.length,
+    reassigned: changedCount,
+  });
 }
+
 
 function send(socket: EastSocket, msg: unknown) {
   if (socket.readyState === WebSocket.OPEN) {
@@ -258,8 +275,13 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
       maxLightNodes: MAX_LIGHT_NODES,
       latestHeight: latestHeader?.height ?? -1,
       latestBlockHash,
-      relayRoster: currentRelayRoster,
-      relayRosterSize: currentRelayRoster.length,
+      tierCounts: {
+        leader: [...telemetry.values()].filter((t) => t.tier === "leader").length,
+        guardian: [...telemetry.values()].filter((t) => t.tier === "guardian").length,
+        broadcaster: [...telemetry.values()].filter((t) => t.tier === "broadcaster").length,
+        vision: [...telemetry.values()].filter((t) => t.tier === "vision").length,
+        none: [...telemetry.values()].filter((t) => t.tier === "none").length,
+      },
       fullSyncProviders: currentFullSyncProviders,
       fullSyncProvidersCount: currentFullSyncProviders.length,
       recentHeadersCount: recentHeaders.length,
@@ -268,7 +290,8 @@ function handleHttp(req: IncomingMessage, res: ServerResponse) {
       messageStats,
       nodes: [...telemetry.entries()].map(([nodeId, t]) => ({
         nodeId,
-        isRelay: t.isRelay,
+        tier: t.tier,
+        parentNodeId: t.parentNodeId,
         hasFullLedger: t.hasFullLedger,
         connectedAtSeconds: Math.round((Date.now() - t.connectedAt) / 1000),
         lastAckHeight: t.lastAckHeight,
@@ -434,7 +457,8 @@ wss.on("connection", (socket: EastSocket, req) => {
             avgLatencyMs: 0,
             participationSeconds: 0,
             verifiedHeaderCount: 0,
-            isRelay: false,
+            tier: "none",
+            parentNodeId: null,
             hasFullLedger: false,
             messagesReceived: 1,
             messagesSent: 0,
@@ -448,13 +472,16 @@ wss.on("connection", (socket: EastSocket, req) => {
             chainId: msg.chainId,
           });
 
-          // Send current relay roster and full-sync providers
-          send(socket, { type: "relay:roster", relayNodeIds: currentRelayRoster });
+          // Tier assignment isn't sent here — this node has avgLatencyMs:0
+          // (no relay_stats reported yet) so recomputeTiers() wouldn't rank
+          // it into anything but "none" anyway. It gets its real tier +
+          // parent on the next periodic rescore, same as it always waited
+          // for the old roster to consider it.
           send(socket, { type: "full_sync_providers", nodeIds: currentFullSyncProviders });
 
           const nodeTelemetry = telemetry.get(msg.nodeId);
           if (nodeTelemetry) {
-            nodeTelemetry.messagesSent += 2;
+            nodeTelemetry.messagesSent += 1;
           }
         }
 
@@ -722,11 +749,13 @@ wss.on("connection", (socket: EastSocket, req) => {
         lastAckHeight: t?.lastAckHeight ?? -1,
       });
 
-      // Update relay roster if needed
-      if (currentRelayRoster.includes(socket.nodeId)) {
-        currentRelayRoster = currentRelayRoster.filter((id) => id !== socket.nodeId);
-        broadcastToLightNodes({ type: "relay:roster", relayNodeIds: currentRelayRoster });
-        log("RELAY", `🔄 Relay roster updated after node disconnect`, { roster: currentRelayRoster });
+      // If this node had descendants relying on it (anything but a Vision
+      // leaf, which nothing else's parent points to), don't make them wait
+      // out the full rescore interval disconnected from the tree — recompute
+      // right away. A Vision leaving just quietly drops out of the count.
+      if (t && (t.tier === "leader" || t.tier === "guardian" || t.tier === "broadcaster")) {
+        log("TIERS", `🔄 Recomputing tiers early — a ${t.tier} disconnected`, { nodeId: socket.nodeId });
+        recomputeTiers();
       }
       if (currentFullSyncProviders.includes(socket.nodeId)) {
         recomputeFullSyncProviders();
@@ -760,10 +789,10 @@ setInterval(() => {
   }
 }, 30000);
 
-// Rescore + re-promote relay candidates periodically
+// Rescore + re-assign the tier hierarchy periodically
 setInterval(() => {
-  log("RESCORE", `🔄 Starting relay roster rescore`, { currentRosterSize: currentRelayRoster.length, totalNodes: telemetry.size });
-  recomputeRelayRoster();
+  log("RESCORE", `🔄 Starting tier hierarchy rescore`, { totalNodes: telemetry.size });
+  recomputeTiers();
 }, RELAY_RESCORE_INTERVAL_MS);
 
 setInterval(() => {
@@ -780,7 +809,9 @@ setInterval(() => {
     lightNodesConnected: lightNodes.size,
     latestHeight: latestHeader?.height ?? -1,
     recentHeadersCount: recentHeaders.length,
-    relayRosterSize: currentRelayRoster.length,
+    guardianCount: [...telemetry.values()].filter((t) => t.tier === "guardian").length,
+    broadcasterCount: [...telemetry.values()].filter((t) => t.tier === "broadcaster").length,
+    visionCount: [...telemetry.values()].filter((t) => t.tier === "vision").length,
     fullSyncProvidersCount: currentFullSyncProviders.length,
     memoryUsage: process.memoryUsage(),
     messageStats,
